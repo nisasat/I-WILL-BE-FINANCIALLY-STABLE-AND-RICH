@@ -1,0 +1,24 @@
+# Copy this file to config/settings.yaml and fill in your local values.
+# config/settings.yaml is git-ignored so your credentials stay local.
+
+ibkr:
+  host: 127.0.0.1
+  port: 7497          # 7497 = TWS paper, 7496 = TWS live, 4002 = Gateway paper, 4001 = Gateway live
+  client_id: 1
+  account: ""         # e.g. DU1234567
+
+data:
+  historical_dir: data/historical
+  default_timeframe: 1min
+
+backtest:
+  starting_cash: 100000
+  commission: 0.0005
+
+risk:
+  max_position_size: 1
+  max_daily_loss: 1000
+
+logging:
+  level: INFO
+  file: logs/bot.log
