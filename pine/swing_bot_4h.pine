@@ -16,7 +16,9 @@
 //     trade (4H ATR stops are tighter, so dollar risk is reduced to match).
 //
 // LOGIC (same engine as the daily bot)
-//   Trend   : fast EMA > slow EMA on the chart + daily trend agreement
+//   Trend   : selectable 4H condition — "EMA cross (strict)" (fast EMA vs
+//             slow EMA) or "Price vs slow EMA (looser)", which recovers
+//             faster after pullbacks — plus daily trend agreement
 //   Entry   : RSI pullback resuming in the trend direction
 //   Stops   : ATR initial stop, chandelier ATR trail (ratchets only)
 //   Exits   : optional R-multiple take profit, time stop
@@ -49,6 +51,11 @@ strategy("Futures Swing Bot 4H (NQ/ES)",
 // ---- Inputs: trend & entry ----------------------------------------------------
 emaFastLen  = input.int(20,  "Fast EMA",  minval = 2,  group = "Trend")
 emaSlowLen  = input.int(50,  "Slow EMA",  minval = 5,  group = "Trend")
+trendMode   = input.string("EMA cross (strict)", "4H trend condition",
+     options = ["EMA cross (strict)", "Price vs slow EMA (looser)"], group = "Trend",
+     tooltip = "Strict: fast EMA above/below slow EMA. Looser: price above/below " +
+       "the slow EMA — recovers faster after pullbacks, so it catches trend " +
+       "resumptions the strict mode skips, at the cost of more false starts.")
 useHtf      = input.bool(true, "Require daily trend agreement", group = "Trend")
 htfTf       = input.timeframe("D", "Higher timeframe", group = "Trend")
 useRegime   = input.bool(false, "Also require price on the right side of regime EMA", group = "Trend")
@@ -91,8 +98,12 @@ htfDn = request.security(syminfo.tickerid, htfTf,
      ta.ema(close, emaFastLen)[1] < ta.ema(close, emaSlowLen)[1],
      lookahead = barmerge.lookahead_on)
 
-trendUp = emaFast > emaSlow and (not useHtf or htfUp) and (not useRegime or close > emaRegime)
-trendDn = emaFast < emaSlow and (not useHtf or htfDn) and (not useRegime or close < emaRegime)
+strictTrend = trendMode == "EMA cross (strict)"
+chartUp = strictTrend ? emaFast > emaSlow : close > emaSlow
+chartDn = strictTrend ? emaFast < emaSlow : close < emaSlow
+
+trendUp = chartUp and (not useHtf or htfUp) and (not useRegime or close > emaRegime)
+trendDn = chartDn and (not useHtf or htfDn) and (not useRegime or close < emaRegime)
 
 // US-hours filter: only enter on bars that close ~9am-4pm Chicago time.
 closeHour = hour(time_close, "America/Chicago")
@@ -184,8 +195,8 @@ bgcolor(inLong ? color.new(color.teal, 92) : inShort ? color.new(color.maroon, 9
 var table info = table.new(position.top_right, 2, 6, border_width = 1)
 if barstate.islast
     table.cell(info, 0, 0, "4H trend",  text_color = color.gray, text_size = size.small)
-    table.cell(info, 1, 0, emaFast > emaSlow ? "UP" : "DOWN", text_size = size.small,
-         text_color = emaFast > emaSlow ? color.green : color.red)
+    table.cell(info, 1, 0, chartUp ? "UP" : chartDn ? "DOWN" : "mixed", text_size = size.small,
+         text_color = chartUp ? color.green : chartDn ? color.red : color.gray)
     table.cell(info, 0, 1, "Daily trend", text_color = color.gray, text_size = size.small)
     table.cell(info, 1, 1, htfUp ? "UP" : htfDn ? "DOWN" : "mixed", text_size = size.small,
          text_color = htfUp ? color.green : htfDn ? color.red : color.gray)
