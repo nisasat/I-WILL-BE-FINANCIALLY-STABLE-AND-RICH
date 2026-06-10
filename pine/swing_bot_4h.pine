@@ -1,0 +1,200 @@
+//@version=6
+// Futures Swing Bot 4H (NQ1! / ES1!) --------------------------------------------
+//
+// The 4-hour version of the swing bot: several signals per week instead of
+// one decision per day. Designed for the 4H chart of CME_MINI:NQ1! or
+// CME_MINI:ES1!.
+//
+// WHAT'S DIFFERENT FROM THE DAILY VERSION
+//   - Daily trend filter: entries must agree with the DAILY EMA trend
+//     (classic "trade 4H pullbacks in the direction of the daily trend").
+//     Uses the last CONFIRMED daily bar, so it never repaints.
+//   - US-hours entry filter: new entries only on 4H bars that close during
+//     US trading hours (~9am-4pm Chicago), so semi-automatic alerts don't
+//     arrive at 2am. Stops/exits remain active around the clock.
+//   - Re-tuned defaults: ~1 week time stop (42 x 4H bars), $1,500 risk per
+//     trade (4H ATR stops are tighter, so dollar risk is reduced to match).
+//
+// LOGIC (same engine as the daily bot)
+//   Trend   : fast EMA > slow EMA on the chart + daily trend agreement
+//   Entry   : RSI pullback resuming in the trend direction
+//   Stops   : ATR initial stop, chandelier ATR trail (ratchets only)
+//   Exits   : optional R-multiple take profit, time stop
+//   Sizing  : risk-based ($ risk / ATR stop distance) or fixed contracts
+//
+// ALERTS
+//   Add alert -> Condition: this strategy -> "Any alert() function call".
+//   The script supplies the JSON message (action, symbol, qty, stop).
+//
+// DISCLAIMER: futures losses can exceed your deposit. Backtest results are not
+// evidence of future profitability. Paper trade before risking capital.
+// -------------------------------------------------------------------------------
+
+strategy("Futures Swing Bot 4H (NQ/ES)",
+     shorttitle = "Swing Bot 4H",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 150000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.5,
+     slippage = 1,
+     // Futures leverage: ~5% of notional, like real CME initial margin.
+     margin_long = 5,
+     margin_short = 5,
+     process_orders_on_close = true,
+     calc_on_every_tick = false)
+
+// ---- Inputs: trend & entry ----------------------------------------------------
+emaFastLen  = input.int(20,  "Fast EMA",  minval = 2,  group = "Trend")
+emaSlowLen  = input.int(50,  "Slow EMA",  minval = 5,  group = "Trend")
+useHtf      = input.bool(true, "Require daily trend agreement", group = "Trend")
+htfTf       = input.timeframe("D", "Higher timeframe", group = "Trend")
+useRegime   = input.bool(false, "Also require price on the right side of regime EMA", group = "Trend")
+regimeLen   = input.int(200, "Regime EMA", minval = 20, group = "Trend")
+
+rsiLen      = input.int(14, "RSI length", minval = 2, group = "Entry")
+rsiBuy      = input.float(40.0, "Long entry: RSI crosses above",  minval = 5,  maxval = 50, group = "Entry")
+rsiSell     = input.float(60.0, "Short entry: RSI crosses below", minval = 50, maxval = 95, group = "Entry")
+allowLong   = input.bool(true,  "Allow longs",  group = "Entry")
+allowShort  = input.bool(true,  "Allow shorts", group = "Entry")
+useUsHours  = input.bool(true,  "Enter only on bars closing in US hours", group = "Entry")
+
+// ---- Inputs: exits --------------------------------------------------------------
+atrLen      = input.int(14,    "ATR length",          minval = 1,   group = "Exits")
+stopMult    = input.float(2.5, "Initial stop (ATR x)", minval = 0.5, step = 0.1, group = "Exits")
+trailMult   = input.float(3.0, "Trailing stop (ATR x)", minval = 0.5, step = 0.1, group = "Exits")
+useTp       = input.bool(false, "Use take profit", group = "Exits")
+tpRR        = input.float(3.0, "Take profit (R multiple)", minval = 0.5, step = 0.5, group = "Exits")
+maxHold     = input.int(42, "Max holding bars (time stop)", minval = 1, group = "Exits",
+     tooltip = "42 x 4H bars is roughly one trading week")
+
+// ---- Inputs: sizing ---------------------------------------------------------------
+useRiskSize = input.bool(true, "Risk-based position sizing", group = "Sizing")
+riskPerTrade = input.float(1500.0, "Risk per trade ($)", minval = 100, group = "Sizing")
+fixedQty    = input.int(1, "Fixed contracts (if risk sizing off)", minval = 1, group = "Sizing")
+maxQty      = input.int(3, "Max contracts", minval = 1, group = "Sizing")
+
+// ---- Indicators ---------------------------------------------------------------------
+emaFast   = ta.ema(close, emaFastLen)
+emaSlow   = ta.ema(close, emaSlowLen)
+emaRegime = ta.ema(close, regimeLen)
+rsi       = ta.rsi(close, rsiLen)
+atr       = ta.atr(atrLen)
+
+// Daily trend from the last CONFIRMED daily bar (no repaint).
+htfUp = request.security(syminfo.tickerid, htfTf,
+     ta.ema(close, emaFastLen)[1] > ta.ema(close, emaSlowLen)[1],
+     lookahead = barmerge.lookahead_on)
+htfDn = request.security(syminfo.tickerid, htfTf,
+     ta.ema(close, emaFastLen)[1] < ta.ema(close, emaSlowLen)[1],
+     lookahead = barmerge.lookahead_on)
+
+trendUp = emaFast > emaSlow and (not useHtf or htfUp) and (not useRegime or close > emaRegime)
+trendDn = emaFast < emaSlow and (not useHtf or htfDn) and (not useRegime or close < emaRegime)
+
+// US-hours filter: only enter on bars that close ~9am-4pm Chicago time.
+closeHour = hour(time_close, "America/Chicago")
+usHoursOk = not useUsHours or (closeHour >= 8 and closeHour <= 16)
+
+longSignal  = allowLong  and trendUp and ta.crossover(rsi, rsiBuy)  and usHoursOk
+shortSignal = allowShort and trendDn and ta.crossunder(rsi, rsiSell) and usHoursOk
+
+// ---- Position sizing -----------------------------------------------------------------
+stopDist = stopMult * atr
+calcQty() =>
+    int qty = fixedQty
+    if useRiskSize and stopDist > 0 and syminfo.pointvalue > 0
+        qty := int(math.floor(riskPerTrade / (stopDist * syminfo.pointvalue)))
+    math.min(math.max(qty, 1), maxQty)
+
+// ---- Position state --------------------------------------------------------------------
+inLong   = strategy.position_size > 0
+inShort  = strategy.position_size < 0
+flat     = strategy.position_size == 0
+barsHeld = strategy.opentrades > 0 ? bar_index - strategy.opentrades.entry_bar_index(0) : 0
+ready    = bar_index >= math.max(emaSlowLen, useRegime ? regimeLen : 0) and not na(atr)
+
+// ---- Stops: initial + chandelier ratchet --------------------------------------------------
+var float trailStop = na
+var float entryStopDist = na
+
+justEnteredLong  = inLong and not inLong[1]
+justEnteredShort = inShort and not inShort[1]
+
+if justEnteredLong
+    entryStopDist := stopDist
+    trailStop := strategy.opentrades.entry_price(0) - entryStopDist
+if justEnteredShort
+    entryStopDist := stopDist
+    trailStop := strategy.opentrades.entry_price(0) + entryStopDist
+
+if inLong and not justEnteredLong
+    trailStop := math.max(trailStop, close - trailMult * atr)
+if inShort and not justEnteredShort
+    trailStop := math.min(trailStop, close + trailMult * atr)
+if flat
+    trailStop := na
+    entryStopDist := na
+
+// ---- Exit orders ----------------------------------------------------------------------------
+exitMsg = '{"action":"exit","symbol":"' + syminfo.ticker + '","note":"stop/target"}'
+
+if inLong
+    tpLevel = useTp ? strategy.opentrades.entry_price(0) + tpRR * entryStopDist : na
+    strategy.exit("Exit long", from_entry = "Long", stop = trailStop, limit = tpLevel, alert_message = exitMsg)
+if inShort
+    tpLevel = useTp ? strategy.opentrades.entry_price(0) - tpRR * entryStopDist : na
+    strategy.exit("Exit short", from_entry = "Short", stop = trailStop, limit = tpLevel, alert_message = exitMsg)
+
+timeMsg = '{"action":"exit","symbol":"' + syminfo.ticker + '","note":"time stop"}'
+if (inLong or inShort) and barsHeld >= maxHold
+    strategy.close(inLong ? "Long" : "Short", comment = "time stop", alert_message = timeMsg)
+
+// ---- Entry orders -----------------------------------------------------------------------------
+if ready and flat and longSignal
+    qty = calcQty()
+    msg = '{"action":"buy","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(qty) + ',"stop":' + str.tostring(close - stopDist, "#.##") + '}'
+    strategy.entry("Long", strategy.long, qty = qty, comment = "long " + str.tostring(qty), alert_message = msg)
+    alert(msg, alert.freq_once_per_bar_close)
+if ready and flat and shortSignal
+    qty = calcQty()
+    msg = '{"action":"sell","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(qty) + ',"stop":' + str.tostring(close + stopDist, "#.##") + '}'
+    strategy.entry("Short", strategy.short, qty = qty, comment = "short " + str.tostring(qty), alert_message = msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+// ---- alert() notifications for exits ------------------------------------------------------------
+if flat and strategy.position_size[1] > 0
+    alert('{"action":"exit","symbol":"' + syminfo.ticker + '","note":"closed long"}', alert.freq_once_per_bar_close)
+if flat and strategy.position_size[1] < 0
+    alert('{"action":"exit","symbol":"' + syminfo.ticker + '","note":"closed short"}', alert.freq_once_per_bar_close)
+
+// ---- Plots --------------------------------------------------------------------------------------
+plot(emaFast,   "Fast EMA",   color = color.new(color.teal, 0))
+plot(emaSlow,   "Slow EMA",   color = color.new(color.orange, 0))
+plot(useRegime ? emaRegime : na, "Regime EMA", color = color.new(color.gray, 40), linewidth = 2)
+plot(trailStop, "Trailing stop", color = color.red, style = plot.style_linebr, linewidth = 2)
+
+plotshape(ready and flat and longSignal,  "Long signal",  shape.triangleup,   location.belowbar, color.green, size = size.small)
+plotshape(ready and flat and shortSignal, "Short signal", shape.triangledown, location.abovebar, color.red,   size = size.small)
+bgcolor(inLong ? color.new(color.teal, 92) : inShort ? color.new(color.maroon, 92) : na)
+
+// ---- Info table -------------------------------------------------------------------------------------
+var table info = table.new(position.top_right, 2, 6, border_width = 1)
+if barstate.islast
+    table.cell(info, 0, 0, "4H trend",  text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 0, emaFast > emaSlow ? "UP" : "DOWN", text_size = size.small,
+         text_color = emaFast > emaSlow ? color.green : color.red)
+    table.cell(info, 0, 1, "Daily trend", text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 1, htfUp ? "UP" : htfDn ? "DOWN" : "mixed", text_size = size.small,
+         text_color = htfUp ? color.green : htfDn ? color.red : color.gray)
+    table.cell(info, 0, 2, "RSI",      text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 2, str.tostring(rsi, "#.#"), text_size = size.small)
+    table.cell(info, 0, 3, "ATR",      text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 3, str.tostring(atr, "#.##"), text_size = size.small)
+    table.cell(info, 0, 4, "Position", text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 4, inLong ? "LONG (" + str.tostring(barsHeld) + " bars)" :
+         inShort ? "SHORT (" + str.tostring(barsHeld) + " bars)" : "flat", text_size = size.small)
+    table.cell(info, 0, 5, "Stop",     text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 5, na(trailStop) ? "—" : str.tostring(trailStop, "#.##"), text_size = size.small)
