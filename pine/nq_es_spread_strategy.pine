@@ -1,0 +1,138 @@
+//@version=6
+// NQ/ES Spread Mean Reversion ------------------------------------------------
+//
+// Trades the beta-hedged log spread between NQ and ES:
+//   - rolling OLS hedge ratio of log(NQ) on log(ES) over `Beta lookback`
+//   - z-score of the spread over `Z-score lookback`
+//   - enter long spread (long NQ / short ES) at z <= -entryZ,
+//     short spread at z >= entryZ
+//   - exit on reversion (|z| <= exitZ), blow-out stop (|z| >= stopZ),
+//     or a time stop (`Max holding bars`)
+//
+// HOW TO USE
+//   1. Open a CME_MINI:NQ1! chart (daily is what the defaults are tuned for).
+//   2. Add this strategy. The Strategy Tester executes the NQ leg only —
+//      TradingView strategies cannot route orders on a second symbol.
+//   3. To trade the full spread, create an alert on this strategy with
+//      "Order fills" and use {{strategy.order.alert_message}} in the alert
+//      body: every entry/exit emits JSON describing BOTH legs, including the
+//      dollar-neutral ES hedge size, for a webhook/broker bridge.
+//
+// DISCLAIMER: futures losses can exceed your deposit. Backtest results are
+// not evidence of future profitability. Paper trade first.
+// -----------------------------------------------------------------------------
+
+strategy("NQ/ES Spread Mean Reversion",
+     shorttitle = "NQ-ES Spread",
+     overlay = false,
+     pyramiding = 0,
+     initial_capital = 150000,
+     default_qty_type = strategy.fixed,
+     default_qty_value = 1,
+     commission_type = strategy.commission.cash_per_contract,
+     commission_value = 2.5,
+     slippage = 1,
+     process_orders_on_close = true,
+     calc_on_every_tick = false)
+
+// ---- Inputs -----------------------------------------------------------------
+esSymbol     = input.symbol("CME_MINI:ES1!", "ES symbol")
+betaLen      = input.int(90,    "Beta lookback (bars)",    minval = 20)
+zLen         = input.int(30,    "Z-score lookback (bars)", minval = 5)
+entryZ       = input.float(2.0, "Entry z-score",           minval = 0.5, step = 0.1)
+exitZ        = input.float(0.5, "Exit z-score",            minval = 0.0, step = 0.1)
+stopZ        = input.float(3.5, "Stop z-score",            minval = 1.0, step = 0.1)
+maxHold      = input.int(25,    "Max holding bars",        minval = 1)
+nqQty        = input.int(1,     "NQ contracts per spread", minval = 1)
+nqMult       = input.float(20.0, "NQ $/point", minval = 0.01)
+esMult       = input.float(50.0, "ES $/point", minval = 0.01)
+useDailyStop = input.bool(true,  "Halt entries after daily loss limit")
+maxDailyLoss = input.float(2000.0, "Max daily loss ($)", minval = 0.0)
+
+// ---- Spread state (same math as src/strategies/signals.py) -------------------
+esClose = request.security(esSymbol, timeframe.period, close)
+
+lnNq = math.log(close)
+lnEs = math.log(esClose)
+
+// rolling OLS slope: beta = cov(x, y) / var(x), x = log(ES), y = log(NQ)
+meanX  = ta.sma(lnEs, betaLen)
+meanY  = ta.sma(lnNq, betaLen)
+meanXY = ta.sma(lnEs * lnNq, betaLen)
+meanX2 = ta.sma(lnEs * lnEs, betaLen)
+varX   = meanX2 - meanX * meanX
+beta   = varX <= 0 ? 1.0 : (meanXY - meanX * meanY) / varX
+
+spread     = lnNq - beta * lnEs
+spreadMean = ta.sma(spread, zLen)
+spreadStd  = ta.stdev(spread, zLen)
+z = spreadStd > 0 ? (spread - spreadMean) / spreadStd : na
+
+// ES contracts that dollar-hedge the NQ leg at the current ratio
+esQty = math.max(1, math.round(beta * (close * nqMult) / (esClose * esMult) * nqQty))
+
+// ---- Risk guard: daily loss limit --------------------------------------------
+var float dayStartEquity = na
+newDay = ta.change(time("D")) != 0
+if newDay or na(dayStartEquity)
+    dayStartEquity := strategy.equity
+dailyPnl = strategy.equity - dayStartEquity
+riskOk   = not useDailyStop or dailyPnl > -maxDailyLoss
+
+// ---- Position state -----------------------------------------------------------
+inLong   = strategy.position_size > 0
+inShort  = strategy.position_size < 0
+flat     = strategy.position_size == 0
+barsHeld = strategy.opentrades > 0 ? bar_index - strategy.opentrades.entry_bar_index(0) : 0
+
+ready = not na(z) and bar_index >= betaLen
+
+// ---- Exits --------------------------------------------------------------------
+exitLong  = inLong  and (z >= -exitZ or z <= -stopZ or barsHeld >= maxHold)
+exitShort = inShort and (z <=  exitZ or z >=  stopZ or barsHeld >= maxHold)
+
+exitMsg = '{"action":"exit_spread","NQ":"FLATTEN","ES":"FLATTEN","z":' + str.tostring(z, "#.##") + '}'
+if ready and exitLong
+    strategy.close("Long spread", comment = "exit z=" + str.tostring(z, "#.##"), alert_message = exitMsg)
+if ready and exitShort
+    strategy.close("Short spread", comment = "exit z=" + str.tostring(z, "#.##"), alert_message = exitMsg)
+
+// ---- Entries --------------------------------------------------------------------
+longMsg  = '{"action":"enter_long_spread","NQ":"BUY '  + str.tostring(nqQty) + '","ES":"SELL ' + str.tostring(esQty) + '","beta":' + str.tostring(beta, "#.###") + ',"z":' + str.tostring(z, "#.##") + '}'
+shortMsg = '{"action":"enter_short_spread","NQ":"SELL ' + str.tostring(nqQty) + '","ES":"BUY ' + str.tostring(esQty) + '","beta":' + str.tostring(beta, "#.###") + ',"z":' + str.tostring(z, "#.##") + '}'
+
+if ready and flat and riskOk and z <= -entryZ
+    strategy.entry("Long spread", strategy.long, qty = nqQty, comment = "long z=" + str.tostring(z, "#.##"), alert_message = longMsg)
+if ready and flat and riskOk and z >= entryZ
+    strategy.entry("Short spread", strategy.short, qty = nqQty, comment = "short z=" + str.tostring(z, "#.##"), alert_message = shortMsg)
+
+// ---- Plots ----------------------------------------------------------------------
+plot(z, "Spread z-score", color = color.blue, linewidth = 2)
+plot(entryZ,  "Entry +", color = color.new(color.red, 40))
+plot(-entryZ, "Entry -", color = color.new(color.green, 40))
+plot(exitZ,   "Exit +",  color = color.new(color.gray, 60))
+plot(-exitZ,  "Exit -",  color = color.new(color.gray, 60))
+plot(stopZ,   "Stop +",  color = color.new(color.red, 0), style = plot.style_circles)
+plot(-stopZ,  "Stop -",  color = color.new(color.red, 0), style = plot.style_circles)
+hline(0, "Zero", color = color.new(color.gray, 70))
+
+bgcolor(inLong ? color.new(color.teal, 88) : inShort ? color.new(color.maroon, 88) : na)
+
+// ---- Info table --------------------------------------------------------------------
+var table info = table.new(position.top_right, 2, 6, border_width = 1)
+if barstate.islast
+    table.cell(info, 0, 0, "Beta",        text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 0, str.tostring(beta, "#.###"), text_size = size.small)
+    table.cell(info, 0, 1, "Z-score",     text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 1, str.tostring(z, "#.##"), text_size = size.small,
+         text_color = z >= entryZ or z <= -entryZ ? color.red : color.white)
+    table.cell(info, 0, 2, "ES hedge",    text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 2, str.tostring(esQty) + " per " + str.tostring(nqQty) + " NQ", text_size = size.small)
+    table.cell(info, 0, 3, "Position",    text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 3, inLong ? "LONG spread" : inShort ? "SHORT spread" : "flat", text_size = size.small)
+    table.cell(info, 0, 4, "Daily PnL",   text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 4, str.tostring(dailyPnl, "#"), text_size = size.small,
+         text_color = riskOk ? color.white : color.red)
+    table.cell(info, 0, 5, "Chart",       text_color = color.gray, text_size = size.small)
+    table.cell(info, 1, 5, syminfo.root == "NQ" ? "OK (NQ)" : "⚠ expected NQ1!", text_size = size.small,
+         text_color = syminfo.root == "NQ" ? color.white : color.orange)

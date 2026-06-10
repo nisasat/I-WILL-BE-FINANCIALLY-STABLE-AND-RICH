@@ -137,6 +137,25 @@ python -m src.main live --poll 3600
 Strategy, risk, and broker parameters live in `config/settings.yaml` (see the
 example file).
 
+## TradingView (Pine Script)
+
+`pine/nq_es_spread_strategy.pine` is a Pine v6 port of the same strategy for
+TradingView:
+
+1. Open a **CME_MINI:NQ1!** chart (daily timeframe matches the defaults) and
+   paste the script into the Pine Editor.
+2. TradingView strategies can only place orders on the chart's own symbol, so
+   the Strategy Tester executes the **NQ leg only** — treat its PnL as an
+   approximation of half the spread.
+3. To trade the full spread, create an alert on the strategy with
+   `{{strategy.order.alert_message}}` in the message body: every entry/exit
+   emits JSON describing **both legs**, including the dollar-neutral ES hedge
+   size (e.g. `{"action":"enter_long_spread","NQ":"BUY 1","ES":"SELL 2",...}`),
+   ready for a webhook → broker bridge.
+
+Inputs mirror `config/settings.yaml` (beta/z lookbacks, entry/exit/stop
+z-scores, time stop, contract multipliers, daily loss halt).
+
 ## Tests
 
 ```bash
