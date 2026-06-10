@@ -32,6 +32,11 @@ strategy("NQ/ES Spread Mean Reversion",
      commission_type = strategy.commission.cash_per_contract,
      commission_value = 2.5,
      slippage = 1,
+     // Futures leverage: ~5% of notional, like real CME initial margin.
+     // Pine v6 defaults to 100 (full notional in cash), which silently
+     // rejects every entry once contract notional exceeds account equity.
+     margin_long = 5,
+     margin_short = 5,
      process_orders_on_close = true,
      calc_on_every_tick = false)
 
