@@ -5,8 +5,28 @@ A Python 3.11 futures trading bot scaffold that uses
 [`ib_insync`](https://github.com/erdewit/ib_insync) for live integration with
 Interactive Brokers (IBKR).
 
-This repository currently contains only the project layout — no strategy logic
-has been implemented yet.
+The implemented strategy trades the **NQ/ES spread** (mean reversion on the
+beta-hedged log spread between Nasdaq-100 and S&P 500 E-mini futures):
+
+- rolling OLS hedge ratio of `log(NQ)` on `log(ES)` (`beta_lookback` bars)
+- z-score of the spread over `z_lookback` bars
+- enter long spread (long NQ / short ES) at `z <= -entry_z`, short spread at
+  `z >= entry_z`
+- exit on reversion (`|z| <= exit_z`), blow-out stop (`|z| >= stop_z`), or a
+  time stop (`max_holding_bars`)
+- ES leg sized to dollar-hedge the NQ leg using the contract multipliers
+  ($20/pt NQ, $50/pt ES)
+- a risk manager caps per-leg contracts and halts entries after a daily loss
+  limit is breached
+
+The same signal engine (`src/strategies/signals.py`) drives both the
+backtrader backtest and the live IBKR loop, so what you backtest is what you
+trade.
+
+> **Disclaimer:** futures trading involves substantial risk of loss; losses
+> can exceed your deposit. A profitable backtest — especially on synthetic
+> data — is *not* evidence of future profitability. Always validate on real
+> historical data, then paper trade before risking capital.
 
 ## Requirements
 
@@ -93,8 +113,29 @@ cp config/settings.yaml.example config/settings.yaml
 
 ## Running
 
-Scripts and entry points will be added as strategies are implemented. For now,
-everything in `src/` is intentionally empty.
+Backtest on real NQ=F / ES=F data (downloaded via yfinance and cached under
+`data/historical/`):
+
+```bash
+python -m src.main backtest --start 2020-01-01 --end 2026-06-01
+```
+
+Backtest on synthetic cointegrated data (no network required — useful for
+development and CI):
+
+```bash
+python -m src.main backtest --synthetic --bars 1500 --seed 42
+```
+
+Live/paper trading (requires TWS or IB Gateway running; the CLI refuses live
+ports unless you pass `--i-know-this-is-live`):
+
+```bash
+python -m src.main live --poll 3600
+```
+
+Strategy, risk, and broker parameters live in `config/settings.yaml` (see the
+example file).
 
 ## Tests
 

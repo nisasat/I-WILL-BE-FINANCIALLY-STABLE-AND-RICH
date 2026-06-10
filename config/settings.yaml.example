@@ -9,15 +9,26 @@ ibkr:
 
 data:
   historical_dir: data/historical
-  default_timeframe: 1min
+  default_timeframe: 1d
 
 backtest:
-  starting_cash: 100000
-  commission: 0.0005
+  starting_cash: 150000
+  commission_per_contract: 2.5   # USD, one-way, per contract
+  slippage_points: 0.25          # one tick on both NQ and ES
+
+# NQ/ES spread mean-reversion parameters
+strategy:
+  beta_lookback: 90       # bars for the rolling OLS hedge ratio
+  z_lookback: 30          # bars for the spread z-score
+  entry_z: 2.0            # enter when |z| >= entry_z
+  exit_z: 0.5             # exit when the spread reverts inside +/- exit_z
+  stop_z: 3.5             # hard stop if the spread blows out further
+  max_holding_bars: 25    # time stop
+  nq_contracts: 1         # NQ contracts per spread (ES leg auto-hedged)
 
 risk:
-  max_position_size: 1
-  max_daily_loss: 1000
+  max_position_size: 3    # max contracts per leg
+  max_daily_loss: 2000    # USD; entries blocked for the rest of the day
 
 logging:
   level: INFO
