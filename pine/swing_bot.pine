@@ -16,9 +16,12 @@
 //   Sizing       : fixed contracts, or risk-based ($ risk / ATR stop distance)
 //
 // ALERTS
-//   Create one alert on this strategy with "Order fills and alert() function
-//   calls" and put {{strategy.order.alert_message}} in the message body.
-//   Entries and exits emit JSON for webhook -> broker bridges.
+//   The script calls alert() itself on every entry and exit, so setup is:
+//   Add alert -> Condition: this strategy -> "Any alert() function call".
+//   Leave the message box as-is; the script supplies the JSON message
+//   (action, symbol, qty, stop) for each signal.
+//   If your alert dialog also offers "Order fills...", that works too via
+//   {{strategy.order.alert_message}} — both channels carry the same JSON.
 //
 // DISCLAIMER: futures losses can exceed your deposit. Backtest results are not
 // evidence of future profitability. Paper trade before risking capital.
@@ -135,14 +138,22 @@ if (inLong or inShort) and barsHeld >= maxHold
 // ---- Entry orders -----------------------------------------------------------------------------
 if ready and flat and longSignal
     qty = calcQty()
-    strategy.entry("Long", strategy.long, qty = qty,
-         comment = "long " + str.tostring(qty),
-         alert_message = '{"action":"buy","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(qty) + ',"stop":' + str.tostring(close - stopDist, "#.##") + '}')
+    msg = '{"action":"buy","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(qty) + ',"stop":' + str.tostring(close - stopDist, "#.##") + '}'
+    strategy.entry("Long", strategy.long, qty = qty, comment = "long " + str.tostring(qty), alert_message = msg)
+    alert(msg, alert.freq_once_per_bar_close)
 if ready and flat and shortSignal
     qty = calcQty()
-    strategy.entry("Short", strategy.short, qty = qty,
-         comment = "short " + str.tostring(qty),
-         alert_message = '{"action":"sell","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(qty) + ',"stop":' + str.tostring(close + stopDist, "#.##") + '}')
+    msg = '{"action":"sell","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(qty) + ',"stop":' + str.tostring(close + stopDist, "#.##") + '}'
+    strategy.entry("Short", strategy.short, qty = qty, comment = "short " + str.tostring(qty), alert_message = msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+// ---- alert() notifications for exits ------------------------------------------------------------
+// Fires when a position that existed on the prior bar is gone (stop, target,
+// or time stop). Detected on bar close, matching this bot's decision cadence.
+if flat and strategy.position_size[1] > 0
+    alert('{"action":"exit","symbol":"' + syminfo.ticker + '","note":"closed long"}', alert.freq_once_per_bar_close)
+if flat and strategy.position_size[1] < 0
+    alert('{"action":"exit","symbol":"' + syminfo.ticker + '","note":"closed short"}', alert.freq_once_per_bar_close)
 
 // ---- Plots --------------------------------------------------------------------------------------
 plot(emaFast,   "Fast EMA",   color = color.new(color.teal, 0))
