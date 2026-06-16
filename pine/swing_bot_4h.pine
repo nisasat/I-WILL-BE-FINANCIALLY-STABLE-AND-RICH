@@ -67,6 +67,7 @@ rsiSell     = input.float(60.0, "Short entry: RSI crosses below", minval = 50, m
 allowLong   = input.bool(true,  "Allow longs",  group = "Entry")
 allowShort  = input.bool(true,  "Allow shorts", group = "Entry")
 useUsHours  = input.bool(true,  "Enter only on bars closing in US hours", group = "Entry")
+showReason  = input.bool(true,  "Show 'WHY' label on entries (hover for details)", group = "Entry")
 
 // ---- Inputs: exits --------------------------------------------------------------
 atrLen      = input.int(14,    "ATR length",          minval = 1,   group = "Exits")
@@ -163,17 +164,45 @@ timeMsg = '{"action":"exit","symbol":"' + syminfo.ticker + '","note":"time stop"
 if (inLong or inShort) and barsHeld >= maxHold
     strategy.close(inLong ? "Long" : "Short", comment = "time stop", alert_message = timeMsg)
 
+// ---- Why-it-traded reason builder --------------------------------------------------------------
+// Spells out, in plain English, every condition that was true at the entry
+// bar. Settings-aware: only mentions filters that were actually switched on.
+modeTxt   = strictTrend ? "20 EMA above 50 EMA" : "price above 50 EMA"
+modeTxtDn = strictTrend ? "20 EMA below 50 EMA" : "price below 50 EMA"
+htfTxtUp  = useHtf    ? " + daily trend up"       : ""
+htfTxtDn  = useHtf    ? " + daily trend down"     : ""
+regTxtUp  = useRegime ? " + price above regime EMA" : ""
+regTxtDn  = useRegime ? " + price below regime EMA" : ""
+riskTxt   = " | ATR " + str.tostring(atr, "#.##") + " -> stop " + str.tostring(stopDist, "#.##") + " pts"
+
+buildReason(bool isLong, int qty) =>
+    dir   = isLong ? "LONG" : "SHORT"
+    trend = isLong ? (modeTxt + htfTxtUp + regTxtUp) : (modeTxtDn + htfTxtDn + regTxtDn)
+    thr   = isLong ? rsiBuy : rsiSell
+    cross = isLong ? "RSI crossed up through " : "RSI crossed down through "
+    dir + " | 4H trend: " + trend + " | " + cross + str.tostring(thr, "#.#") +
+         " (" + str.tostring(rsi[1], "#.#") + " -> " + str.tostring(rsi, "#.#") + ")" +
+         riskTxt + " | size " + str.tostring(qty) + " @ " + str.tostring(close, "#.##")
+
 // ---- Entry orders -----------------------------------------------------------------------------
 if ready and flat and longSignal
     qty = calcQty()
-    msg = '{"action":"buy","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(qty) + ',"stop":' + str.tostring(close - stopDist, "#.##") + '}'
-    strategy.entry("Long", strategy.long, qty = qty, comment = "long " + str.tostring(qty), alert_message = msg)
+    reason = buildReason(true, qty)
+    msg = '{"action":"buy","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(qty) + ',"stop":' + str.tostring(close - stopDist, "#.##") + ',"reason":"' + reason + '"}'
+    strategy.entry("Long", strategy.long, qty = qty, comment = reason, alert_message = msg)
     alert(msg, alert.freq_once_per_bar_close)
+    if showReason
+        label.new(bar_index, low, "WHY", yloc = yloc.belowbar, color = color.new(color.green, 20),
+             textcolor = color.white, style = label.style_label_up, size = size.small, tooltip = reason)
 if ready and flat and shortSignal
     qty = calcQty()
-    msg = '{"action":"sell","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(qty) + ',"stop":' + str.tostring(close + stopDist, "#.##") + '}'
-    strategy.entry("Short", strategy.short, qty = qty, comment = "short " + str.tostring(qty), alert_message = msg)
+    reason = buildReason(false, qty)
+    msg = '{"action":"sell","symbol":"' + syminfo.ticker + '","qty":' + str.tostring(qty) + ',"stop":' + str.tostring(close + stopDist, "#.##") + ',"reason":"' + reason + '"}'
+    strategy.entry("Short", strategy.short, qty = qty, comment = reason, alert_message = msg)
     alert(msg, alert.freq_once_per_bar_close)
+    if showReason
+        label.new(bar_index, high, "WHY", yloc = yloc.abovebar, color = color.new(color.red, 20),
+             textcolor = color.white, style = label.style_label_down, size = size.small, tooltip = reason)
 
 // ---- alert() notifications for exits ------------------------------------------------------------
 if flat and strategy.position_size[1] > 0
