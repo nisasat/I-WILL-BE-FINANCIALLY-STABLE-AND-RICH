@@ -63,7 +63,7 @@
 // checks entirely.
 strategy(
      title                    = "FVG + IFVG Swing Strategy [5m MES/MNQ]",
-     shorttitle               = "FVG/IFVG Swing",
+     shorttitle               = "FVG/IFVG",
      overlay                  = true,
      initial_capital          = 25000,
      currency                 = currency.USD,
