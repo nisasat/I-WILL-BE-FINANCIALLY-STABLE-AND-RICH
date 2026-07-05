@@ -25,6 +25,19 @@
 //       conservative and non-repainting, but live fills will differ slightly.
 //     • This is a STARTING POINT for research, not financial advice and not a finished system.
 //       Forward-test on paper before risking real money.
+//  6. NO RESULTS IN THE STRATEGY TESTER? Work through this list:
+//     a) Open the "Strategy Tester" tab at the BOTTOM of the chart (it does not pop up on its own).
+//     b) If it says "no data" / no trades were generated: make sure you are on a 5-MINUTE chart of
+//        MES1!/MNQ1! and scroll left so enough history is loaded (the 15m EMA needs ~50 bars of
+//        15m data plus pivot warm-up before the first signal can even exist).
+//     c) Margin: this script sets margin_long/margin_short = 5 (futures-style leverage). If you
+//        change initial_capital or trade full-size contracts, entries that exceed available margin
+//        are SILENTLY skipped — set both margins to 0 to rule this out.
+//     d) Loosen filters step by step to find the blocker: Confluences required → 0,
+//        Bias method → "Off (no bias filter)", Restrict to NY RTH → off, Minimum FVG size → Off.
+//        If trades appear, re-tighten one input at a time.
+//     e) A red/orange (!) next to the strategy name on the chart = runtime error — click it and
+//        fix (or report) the message. The tester stays empty while an error is active.
 //
 //  STRATEGY LOGIC SUMMARY
 //  ──────────────────────
@@ -42,6 +55,12 @@
 
 // NOTE: default_qty_* in the declaration is only a fallback. Actual size is computed per-trade
 // from the "Position Sizing" inputs (Fixed Contracts OR Risk % of Equity) in section 7.
+//
+// CRITICAL for futures: TradingView defaults margin_long/margin_short to 100% (cash account).
+// One MES contract is ~$30k notional > $25k initial capital, so with the default EVERY entry is
+// silently rejected and the Strategy Tester stays empty. margin = 5 approximates real intraday
+// futures margin (MES day margin ≈ $1.5-2k vs ~$30k notional). Set both to 0 to disable margin
+// checks entirely.
 strategy(
      title                    = "FVG + IFVG Swing Strategy [5m MES/MNQ]",
      shorttitle               = "FVG/IFVG Swing",
@@ -53,6 +72,8 @@ strategy(
      commission_type          = strategy.commission.cash_per_contract, // futures: $ per contract per fill
      commission_value         = 0.75,                                  // ~all-in cost per side for micros
      slippage                 = 1,                                     // 1 tick of slippage per fill
+     margin_long              = 5,                                     // see CRITICAL note above
+     margin_short             = 5,
      calc_on_every_tick       = false,                                 // evaluate on closed bars only
      process_orders_on_close  = false,                                 // fills happen on next bar open
      pyramiding               = 0,
@@ -93,8 +114,8 @@ maxTrackedZones = input.int(40, "Max tracked zones", minval = 5, maxval = 100, g
 // ── Higher timeframe bias ──────────────────────────────────────────────────────────────────────
 var string G_HTF = "Higher Timeframe Bias (15m)"
 htfTf      = input.timeframe("15", "Bias timeframe", group = G_HTF)
-biasMode   = input.string("Price vs EMA", "Bias method", options = ["Price vs EMA", "EMA Slope"], group = G_HTF,
-     tooltip = "Price vs EMA: bullish when the last CONFIRMED 15m close is above the 15m EMA. EMA Slope: bullish when the 15m EMA is rising.")
+biasMode   = input.string("Price vs EMA", "Bias method", options = ["Price vs EMA", "EMA Slope", "Off (no bias filter)"], group = G_HTF,
+     tooltip = "Price vs EMA: bullish when the last CONFIRMED 15m close is above the 15m EMA. EMA Slope: bullish when the 15m EMA is rising. Off: take both directions regardless of HTF — useful for debugging why no trades fire.")
 htfEmaLen  = input.int(50, "HTF EMA length", minval = 5, group = G_HTF)
 showHtfEma = input.bool(true, "Plot HTF EMA", group = G_HTF)
 showBiasBg = input.bool(true, "Background-tint active bias", group = G_HTF)
@@ -183,9 +204,11 @@ htfCloseCnf = request.security(syminfo.tickerid, htfTf, close[1],               
 
 // "EMA Slope" compares the confirmed HTF EMA against its value a few chart bars back — a simple
 // rising/falling proxy that avoids a second security() call.
-biasBull = biasMode == "Price vs EMA" ? htfCloseCnf > htfEma : htfEma > htfEma[3]
-biasBear = biasMode == "Price vs EMA" ? htfCloseCnf < htfEma : htfEma < htfEma[3]
-// Note: while htfEma is still na (warm-up), both flags are false → no trades. That is intended.
+biasOff  = biasMode == "Off (no bias filter)"
+biasBull = biasOff ? true : biasMode == "Price vs EMA" ? htfCloseCnf > htfEma : htfEma > htfEma[3]
+biasBear = biasOff ? true : biasMode == "Price vs EMA" ? htfCloseCnf < htfEma : htfEma < htfEma[3]
+// Note: while htfEma is still na (warm-up), both flags are false → no trades. That is intended
+// (unless bias is Off, in which case both directions are always allowed).
 
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //  4. MARKET STRUCTURE: PIVOTS, LIQUIDITY SWEEPS, MSS
@@ -554,9 +577,9 @@ if justClosed
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 //  (FVG/IFVG boxes are drawn in section 5. Everything else lives here.)
 
-// HTF bias: EMA line + background tint.
-plot(showHtfEma ? htfEma : na, "HTF EMA", color = biasBull ? color.new(#26a69a, 20) : color.new(#ef5350, 20), linewidth = 2)
-bgcolor(showBiasBg ? (biasBull ? color.new(#26a69a, 94) : biasBear ? color.new(#ef5350, 94) : na) : na, title = "HTF bias tint")
+// HTF bias: EMA line + background tint (neutral gray when the bias filter is Off).
+plot(showHtfEma ? htfEma : na, "HTF EMA", color = biasOff ? color.new(color.gray, 40) : biasBull ? color.new(#26a69a, 20) : color.new(#ef5350, 20), linewidth = 2)
+bgcolor(showBiasBg and not biasOff ? (biasBull ? color.new(#26a69a, 94) : biasBear ? color.new(#ef5350, 94) : na) : na, title = "HTF bias tint")
 
 // Entry signal markers. NOTE: the marker shows the SIGNAL bar — the fill happens on the next bar
 // open (market) or when the limit is touched.
