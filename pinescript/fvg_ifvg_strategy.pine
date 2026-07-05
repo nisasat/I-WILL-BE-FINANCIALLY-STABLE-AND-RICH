@@ -1,0 +1,580 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  FVG + IFVG SWING STRATEGY  —  ICT / Smart Money Concepts  —  5m execution / 15m bias
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//
+//  HOW TO USE THIS STRATEGY IN THE STRATEGY TESTER
+//  ────────────────────────────────────────────────
+//  1. Recommended symbols : MES1! / MNQ1! (micro futures, continuous contract). ES1!/NQ1! work
+//     too, but micros let you size realistically on a small account.
+//  2. Recommended chart   : 5-minute. The HTF bias is pulled from 15m internally — do NOT change
+//     the chart timeframe above 15m or the bias becomes meaningless.
+//  3. Position sizing     : Default is "Risk % of Equity" at 1% on a $25,000 initial capital.
+//     Example ($25k account, MES, point value $5, tick $1.25):
+//        risk 1% = $250. A 10-point (40-tick) stop risks $50/contract → 5 contracts.
+//     The script computes this for you from the actual stop distance. Switch to
+//     "Fixed Contracts" if you prefer a constant size.
+//  4. Commission/slippage : Defaults assume ~$0.75/contract/side commission+fees and 1 tick of
+//     slippage per fill. Adjust in the strategy() header for your broker.
+//  5. WARNINGS — read before trusting any backtest:
+//     • TradingView fills orders on OHLC of the chart bars only. Intrabar stop/target sequencing
+//       on a 5m bar is APPROXIMATED — always validate entries with Bar Replay before going live.
+//     • Continuous futures contracts (MES1!) contain roll gaps that can distort results.
+//     • Signals are evaluated on CLOSED bars and orders fill on the NEXT bar open
+//       (calc_on_every_tick = false, process_orders_on_close = false). This is deliberately
+//       conservative and non-repainting, but live fills will differ slightly.
+//     • This is a STARTING POINT for research, not financial advice and not a finished system.
+//       Forward-test on paper before risking real money.
+//
+//  STRATEGY LOGIC SUMMARY
+//  ──────────────────────
+//  • Detects 3-candle Fair Value Gaps (FVG) on the chart timeframe (5m intended).
+//  • When price closes THROUGH an FVG, the zone flips into an Inversion FVG (IFVG) and acts as
+//    support/resistance in the opposite direction.
+//  • Entries: price taps a bullish FVG/IFVG (long) or bearish FVG/IFVG (short) and closes with a
+//    rejection, WITH 15-minute EMA bias agreement, WITH >= N of the optional confluences:
+//    displacement, liquidity sweep, market-structure shift, NY kill-zone timing.
+//  • Exits: structural stop beyond the zone/swing (+ ATR buffer), scale-out at TP1, runner to a
+//    fixed R multiple or an ATR trailing stop. Optional break-even after TP1.
+//  • Filters: NY RTH session, optional kill zones, max trades per direction per day, optional
+//    end-of-day flat, and a commented-out daily loss limit you can enable.
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+// NOTE: default_qty_* in the declaration is only a fallback. Actual size is computed per-trade
+// from the "Position Sizing" inputs (Fixed Contracts OR Risk % of Equity) in section 7.
+strategy(
+     title                    = "FVG + IFVG Swing Strategy [5m MES/MNQ]",
+     shorttitle               = "FVG/IFVG Swing",
+     overlay                  = true,
+     initial_capital          = 25000,
+     currency                 = currency.USD,
+     default_qty_type         = strategy.fixed,
+     default_qty_value        = 1,
+     commission_type          = strategy.commission.cash_per_contract, // futures: $ per contract per fill
+     commission_value         = 0.75,                                  // ~all-in cost per side for micros
+     slippage                 = 1,                                     // 1 tick of slippage per fill
+     calc_on_every_tick       = false,                                 // evaluate on closed bars only
+     process_orders_on_close  = false,                                 // fills happen on next bar open
+     pyramiding               = 0,
+     max_bars_back            = 500,
+     max_boxes_count          = 500,
+     max_labels_count         = 500,
+     max_lines_count          = 500)
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  1. INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+// ── Position sizing & risk ─────────────────────────────────────────────────────────────────────
+var string G_RISK = "Position Sizing & Risk"
+sizingMode     = input.string("Risk % of Equity", "Sizing mode", options = ["Risk % of Equity", "Fixed Contracts"], group = G_RISK,
+     tooltip = "Risk % of Equity: contracts = floor(equity * risk% / $risk-per-contract at the stop). Fixed Contracts: always trade the same size. Futures users: 1 MES point = $5, 1 MNQ point = $2.")
+riskPct        = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, maxval = 10, step = 0.25, group = G_RISK,
+     tooltip = "Only used in 'Risk % of Equity' mode. 1% of $25k = $250 risked per trade.")
+fixedContracts = input.int(1, "Fixed contracts", minval = 1, group = G_RISK,
+     tooltip = "Only used in 'Fixed Contracts' mode.")
+
+// ── FVG / IFVG detection ───────────────────────────────────────────────────────────────────────
+var string G_FVG = "FVG / IFVG Detection"
+useFvgEntries   = input.bool(true,  "Trade fresh FVGs",  group = G_FVG)
+useIfvgEntries  = input.bool(true,  "Trade IFVGs (inverted FVGs)", group = G_FVG)
+enableIFVG      = input.bool(true,  "Enable inversion logic", group = G_FVG,
+     tooltip = "ON: an FVG that price closes through flips into an opposite-polarity IFVG zone. OFF: a violated FVG is simply removed.")
+minSizeMode     = input.string("% of ATR", "Minimum FVG size filter", options = ["Off", "Ticks", "% of ATR"], group = G_FVG)
+minSizeTicks    = input.int(4, "Min size (ticks)", minval = 1, group = G_FVG)
+minSizeAtrPct   = input.float(25.0, "Min size (% of ATR)", minval = 1, step = 5, group = G_FVG)
+requireDispFvg  = input.bool(false, "Only track FVGs created by displacement", group = G_FVG,
+     tooltip = "Hard filter at creation time. Leave OFF to track all gaps and let displacement act as a soft confluence instead.")
+dispAtrMult     = input.float(1.0, "Displacement: middle-candle body >= ATR x", minval = 0.1, step = 0.1, group = G_FVG)
+maxZoneAge      = input.int(120, "Zone expiry (bars)", minval = 10, group = G_FVG,
+     tooltip = "Zones older than this are dropped. 120 bars on 5m = one full RTH session.")
+maxTrackedZones = input.int(40, "Max tracked zones", minval = 5, maxval = 100, group = G_FVG)
+
+// ── Higher timeframe bias ──────────────────────────────────────────────────────────────────────
+var string G_HTF = "Higher Timeframe Bias (15m)"
+htfTf      = input.timeframe("15", "Bias timeframe", group = G_HTF)
+biasMode   = input.string("Price vs EMA", "Bias method", options = ["Price vs EMA", "EMA Slope"], group = G_HTF,
+     tooltip = "Price vs EMA: bullish when the last CONFIRMED 15m close is above the 15m EMA. EMA Slope: bullish when the 15m EMA is rising.")
+htfEmaLen  = input.int(50, "HTF EMA length", minval = 5, group = G_HTF)
+showHtfEma = input.bool(true, "Plot HTF EMA", group = G_HTF)
+showBiasBg = input.bool(true, "Background-tint active bias", group = G_HTF)
+
+// ── Entry logic & confluences ──────────────────────────────────────────────────────────────────
+var string G_ENTRY = "Entry Logic & Confluences"
+entryMode      = input.string("Market", "Entry type", options = ["Market", "Limit (zone midpoint)"], group = G_ENTRY,
+     tooltip = "Market: enter next bar open after a valid tap+rejection close. Limit: rest a limit at the tapped zone's midpoint (consequent encroachment).")
+limitExpiryBars= input.int(6, "Limit order expiry (bars)", minval = 1, group = G_ENTRY)
+minConfluences = input.int(2, "Confluences required (of those enabled)", minval = 0, maxval = 4, group = G_ENTRY)
+useDispConf    = input.bool(true, "Confluence: displacement created the zone", group = G_ENTRY)
+useSweepConf   = input.bool(true, "Confluence: recent liquidity sweep", group = G_ENTRY)
+useMssConf     = input.bool(true, "Confluence: recent market structure shift", group = G_ENTRY)
+useKzConf      = input.bool(true, "Confluence: inside NY kill zone", group = G_ENTRY)
+swingLen       = input.int(5, "Swing pivot length (bars each side)", minval = 2, group = G_ENTRY)
+sweepLookback  = input.int(12, "Liquidity sweep valid for (bars)", minval = 1, group = G_ENTRY)
+mssLookback    = input.int(20, "MSS valid for (bars)", minval = 1, group = G_ENTRY)
+
+// ── Trade management ───────────────────────────────────────────────────────────────────────────
+var string G_EXIT = "Trade Management"
+stopMode       = input.string("Zone + ATR buffer", "Stop-loss placement", options = ["Zone + ATR buffer", "Swing + ATR buffer", "Fixed Ticks"], group = G_EXIT)
+stopAtrMult    = input.float(0.5, "Stop ATR buffer multiplier", minval = 0.0, step = 0.1, group = G_EXIT,
+     tooltip = "Extra room beyond the zone edge / swing point, in ATR multiples.")
+stopFixedTicks = input.int(40, "Fixed stop (ticks)", minval = 4, group = G_EXIT,
+     tooltip = "Only used in 'Fixed Ticks' mode. 40 ticks = 10 MES points = $50/contract.")
+rrTarget       = input.float(2.0, "Final target (R multiple)", minval = 1.0, step = 0.25, group = G_EXIT,
+     tooltip = "Minimum 2.0 recommended per the strategy design.")
+useScaleOut    = input.bool(true, "Scale out at TP1", group = G_EXIT)
+tp1RR          = input.float(1.5, "TP1 (R multiple)", minval = 0.5, step = 0.25, group = G_EXIT)
+scaleOutPct    = input.float(50, "TP1 size (% of position)", minval = 10, maxval = 90, step = 10, group = G_EXIT)
+runnerMode     = input.string("Fixed R Target", "Runner exit", options = ["Fixed R Target", "ATR Trail"], group = G_EXIT,
+     tooltip = "Fixed R Target: runner exits at the final R multiple. ATR Trail: after price reaches TP1, trail the runner by ATR x multiplier.")
+trailAtrMult   = input.float(1.5, "Trail distance (ATR x)", minval = 0.25, step = 0.25, group = G_EXIT)
+useBreakeven   = input.bool(true, "Move stop to break-even after TP1 fills", group = G_EXIT)
+beOffsetTicks  = input.int(1, "Break-even offset (ticks)", minval = 0, group = G_EXIT,
+     tooltip = "Ticks of profit locked in when the stop moves to break-even.")
+atrLen         = input.int(14, "ATR length", minval = 2, group = G_EXIT)
+
+// ── Session, time & daily limits ───────────────────────────────────────────────────────────────
+var string G_TIME = "Session & Daily Limits"
+tz            = input.string("America/New_York", "Timezone", group = G_TIME)
+useSession    = input.bool(true, "Restrict to NY RTH session", group = G_TIME)
+sessionStr    = input.session("0930-1600", "RTH session", group = G_TIME)
+useKillZones  = input.bool(false, "HARD filter: only trade inside kill zones", group = G_TIME,
+     tooltip = "OFF by default — kill-zone timing still counts as a soft confluence above.")
+kzStr         = input.session("0930-1100,1400-1530", "Kill zones", group = G_TIME)
+useEodClose   = input.bool(true, "Flatten at end of day", group = G_TIME)
+eodStr        = input.session("1550-1600", "Flatten window", group = G_TIME)
+maxLongsDay   = input.int(2, "Max long entries per day", minval = 1, maxval = 10, group = G_TIME)
+maxShortsDay  = input.int(2, "Max short entries per day", minval = 1, maxval = 10, group = G_TIME)
+
+// ── Visuals ────────────────────────────────────────────────────────────────────────────────────
+var string G_VIS = "Visuals"
+showZones   = input.bool(true, "Draw FVG/IFVG boxes", group = G_VIS)
+colBullFvg  = input.color(color.new(#26a69a, 80), "Bullish FVG", group = G_VIS)
+colBearFvg  = input.color(color.new(#ef5350, 80), "Bearish FVG", group = G_VIS)
+colBullIfvg = input.color(color.new(#2962ff, 72), "Bullish IFVG (flipped bear FVG)", group = G_VIS)
+colBearIfvg = input.color(color.new(#ff6d00, 72), "Bearish IFVG (flipped bull FVG)", group = G_VIS)
+colDead     = color.new(color.gray, 92)          // frozen/expired zones
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  2. CORE SERIES & SESSION STATE
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+atr = ta.atr(atrLen)
+
+// Session windows. time() returns na outside the window, so "not na" = inside.
+inRTH  = not na(time(timeframe.period, sessionStr, tz))
+inKZ   = not na(time(timeframe.period, kzStr, tz))
+eodNow = useEodClose and not na(time(timeframe.period, eodStr, tz))
+
+// Combined hard time filter for NEW entries.
+timeOK = (not useSession or inRTH) and (not useKillZones or inKZ) and not eodNow
+
+// New calendar day → reset daily counters.
+newDay = timeframe.change("D")
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  3. HIGHER TIMEFRAME BIAS (non-repainting)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  We request the value of the PREVIOUS (confirmed) 15m bar with lookahead OFF. This means the
+//  bias never repaints: it only updates once a 15m bar has fully closed.
+
+htfEma      = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfEmaLen)[1], lookahead = barmerge.lookahead_off)
+htfCloseCnf = request.security(syminfo.tickerid, htfTf, close[1],                    lookahead = barmerge.lookahead_off)
+
+// "EMA Slope" compares the confirmed HTF EMA against its value a few chart bars back — a simple
+// rising/falling proxy that avoids a second security() call.
+biasBull = biasMode == "Price vs EMA" ? htfCloseCnf > htfEma : htfEma > htfEma[3]
+biasBear = biasMode == "Price vs EMA" ? htfCloseCnf < htfEma : htfEma < htfEma[3]
+// Note: while htfEma is still na (warm-up), both flags are false → no trades. That is intended.
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  4. MARKET STRUCTURE: PIVOTS, LIQUIDITY SWEEPS, MSS
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  Pivots confirm swingLen bars after the extreme — inherently delayed but non-repainting.
+
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low, swingLen, swingLen)
+
+var float lastPivotHigh = na   // most recent confirmed swing high (buy-side liquidity)
+var float lastPivotLow  = na   // most recent confirmed swing low  (sell-side liquidity)
+if not na(ph)
+    lastPivotHigh := ph
+if not na(pl)
+    lastPivotLow := pl
+
+// Liquidity sweep: price wicks THROUGH the last swing point but closes back on the original side
+// (stop-run / turtle-soup behaviour).
+bullSweep = not na(lastPivotLow)  and low  < lastPivotLow  and close > lastPivotLow
+bearSweep = not na(lastPivotHigh) and high > lastPivotHigh and close < lastPivotHigh
+
+// Market Structure Shift (simplified): a CLOSE through the last confirmed swing point.
+bullMss = not na(lastPivotHigh) and close > lastPivotHigh and close[1] <= lastPivotHigh
+bearMss = not na(lastPivotLow)  and close < lastPivotLow  and close[1] >= lastPivotLow
+
+// "Recent" flags — the event stays valid as a confluence for N bars.
+bullSweepRecent = nz(ta.barssince(bullSweep), 99999) <= sweepLookback
+bearSweepRecent = nz(ta.barssince(bearSweep), 99999) <= sweepLookback
+bullMssRecent   = nz(ta.barssince(bullMss),   99999) <= mssLookback
+bearMssRecent   = nz(ta.barssince(bearMss),   99999) <= mssLookback
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  5. FVG / IFVG DETECTION & ZONE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+// A tracked zone. Polarity (isBull) FLIPS when the zone inverts into an IFVG.
+type Zone
+    float top
+    float bottom
+    bool  isBull           // current polarity: true = acts as support (long zone)
+    bool  isInverted       // true once the zone has flipped into an IFVG
+    bool  hadDisplacement  // was the ORIGINAL gap created by a displacement candle?
+    int   createdBar
+    int   flipBar          // bar_index at inversion (na until inverted)
+    box   bx
+
+var zones = array.new<Zone>()
+
+// Minimum gap-size filter (ticks or % of ATR).
+gapSizeOK(float gapSize) =>
+    switch minSizeMode
+        "Ticks"    => gapSize >= minSizeTicks * syminfo.mintick
+        "% of ATR" => gapSize >= atr * minSizeAtrPct / 100.0
+        => true
+
+// ── 5a. Detect new FVGs (confirmed on close of the 3rd candle → non-repainting) ────────────────
+// Bullish FVG : current low  > high two bars ago (gap between candle 1's high and candle 3's low).
+// Bearish FVG : current high < low  two bars ago.
+// The MIDDLE candle (bar[1]) is the displacement candle.
+bullDisp = (close[1] - open[1]) >= dispAtrMult * atr   // strong bullish middle-candle body
+bearDisp = (open[1] - close[1]) >= dispAtrMult * atr   // strong bearish middle-candle body
+
+newBullFvg = low > high[2]  and gapSizeOK(low - high[2])  and (not requireDispFvg or bullDisp)
+newBearFvg = high < low[2] and gapSizeOK(low[2] - high) and (not requireDispFvg or bearDisp)
+
+if newBullFvg
+    b = box.new(bar_index - 2, low, bar_index, high[2],
+         border_color = showZones ? color.new(colBullFvg, 40) : na,
+         bgcolor      = showZones ? colBullFvg : na,
+         text = "FVG", text_color = color.new(colBullFvg, 30), text_size = size.tiny, text_halign = text.align_right)
+    zones.push(Zone.new(low, high[2], true, false, bullDisp, bar_index, int(na), b))
+
+if newBearFvg
+    b = box.new(bar_index - 2, low[2], bar_index, high,
+         border_color = showZones ? color.new(colBearFvg, 40) : na,
+         bgcolor      = showZones ? colBearFvg : na,
+         text = "FVG", text_color = color.new(colBearFvg, 30), text_size = size.tiny, text_halign = text.align_right)
+    zones.push(Zone.new(low[2], high, false, false, bearDisp, bar_index, int(na), b))
+
+// ── 5b. Update / invert / expire existing zones ─────────────────────────────────────────────────
+// Iterate backwards so removal while looping is safe.
+if zones.size() > 0
+    for i = zones.size() - 1 to 0
+        z = zones.get(i)
+        box.set_right(z.bx, bar_index)     // keep extending the active zone to the right
+        bool kill = false
+
+        if not z.isInverted
+            // A fresh FVG is violated when price CLOSES through its far side.
+            if z.isBull and close < z.bottom
+                if enableIFVG
+                    // Bullish FVG broken downward → becomes a BEARISH IFVG (resistance).
+                    z.isBull     := false
+                    z.isInverted := true
+                    z.flipBar    := bar_index
+                    box.set_bgcolor(z.bx, showZones ? colBearIfvg : na)
+                    box.set_border_color(z.bx, showZones ? color.new(colBearIfvg, 30) : na)
+                    box.set_border_style(z.bx, line.style_dashed)
+                    box.set_text(z.bx, "IFVG")
+                    box.set_text_color(z.bx, color.new(colBearIfvg, 20))
+                else
+                    kill := true
+            else if not z.isBull and close > z.top
+                if enableIFVG
+                    // Bearish FVG broken upward → becomes a BULLISH IFVG (support).
+                    z.isBull     := true
+                    z.isInverted := true
+                    z.flipBar    := bar_index
+                    box.set_bgcolor(z.bx, showZones ? colBullIfvg : na)
+                    box.set_border_color(z.bx, showZones ? color.new(colBullIfvg, 30) : na)
+                    box.set_border_style(z.bx, line.style_dashed)
+                    box.set_text(z.bx, "IFVG")
+                    box.set_text_color(z.bx, color.new(colBullIfvg, 20))
+                else
+                    kill := true
+        else
+            // An IFVG dies when price closes back through its far side (second inversion = chop).
+            if z.isBull and close < z.bottom
+                kill := true
+            else if not z.isBull and close > z.top
+                kill := true
+
+        // Age expiry keeps the chart and the zone array clean.
+        if bar_index - z.createdBar > maxZoneAge
+            kill := true
+
+        if kill
+            box.set_bgcolor(z.bx, showZones ? colDead : na)   // freeze & dim instead of deleting
+            box.set_border_color(z.bx, na)
+            box.set_right(z.bx, bar_index)
+            zones.remove(i)
+
+// Hard cap on tracked zones (oldest dropped first) to protect performance.
+if zones.size() > maxTrackedZones
+    old = zones.shift()
+    box.set_bgcolor(old.bx, showZones ? colDead : na)
+    box.set_border_color(old.bx, na)
+
+// ── 5c. Tap detection ───────────────────────────────────────────────────────────────────────────
+// A LONG tap: this bar's low trades into a bullish zone, but the bar CLOSES back above the zone
+// midpoint (rejection). Mirror for shorts. Newest zones are checked first. Zones cannot signal on
+// the bar they were created or inverted on.
+bool  bullTap     = false
+float tapTopL     = na
+float tapBotL     = na
+bool  tapDispL    = false
+bool  bearTap     = false
+float tapTopS     = na
+float tapBotS     = na
+bool  tapDispS    = false
+
+if zones.size() > 0
+    for i = zones.size() - 1 to 0
+        z = zones.get(i)
+        // Which signal source is this zone allowed to be?
+        sourceOK = z.isInverted ? useIfvgEntries : useFvgEntries
+        matured  = bar_index > z.createdBar and (na(z.flipBar) or bar_index > z.flipBar)
+        if sourceOK and matured
+            mid = math.avg(z.top, z.bottom)
+            if z.isBull and not bullTap and low <= z.top and close > mid
+                bullTap  := true
+                tapTopL  := z.top
+                tapBotL  := z.bottom
+                tapDispL := z.hadDisplacement
+            if not z.isBull and not bearTap and high >= z.bottom and close < mid
+                bearTap  := true
+                tapTopS  := z.top
+                tapBotS  := z.bottom
+                tapDispS := z.hadDisplacement
+        if bullTap and bearTap
+            break
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  6. CONFLUENCE SCORING & SIGNALS
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+// Count how many ENABLED confluences agree. minConfluences of them must be present (default 2).
+int confLong = 0
+confLong += (useDispConf  and tapDispL)        ? 1 : 0
+confLong += (useSweepConf and bullSweepRecent) ? 1 : 0
+confLong += (useMssConf   and bullMssRecent)   ? 1 : 0
+confLong += (useKzConf    and inKZ)            ? 1 : 0
+
+int confShort = 0
+confShort += (useDispConf  and tapDispS)        ? 1 : 0
+confShort += (useSweepConf and bearSweepRecent) ? 1 : 0
+confShort += (useMssConf   and bearMssRecent)   ? 1 : 0
+confShort += (useKzConf    and inKZ)            ? 1 : 0
+
+// Daily entry counters (reset each new day, incremented on actual FILLS in section 7).
+var int longsToday  = 0
+var int shortsToday = 0
+if newDay
+    longsToday  := 0
+    shortsToday := 0
+
+// ── OPTIONAL: DAILY LOSS LIMIT (uncomment to enable) ────────────────────────────────────────────
+// maxDailyLossUSD = input.float(500, "Max daily loss ($)", minval = 50, group = G_TIME)
+// var float dayStartEquity = na
+// if newDay
+//     dayStartEquity := strategy.equity
+// dailyLossHit = not na(dayStartEquity) and (strategy.equity - dayStartEquity) <= -maxDailyLossUSD
+// if dailyLossHit and strategy.position_size != 0
+//     strategy.close_all(comment = "Daily loss limit")
+// ...then add `and not dailyLossHit` to longSignal/shortSignal below.
+
+flat = strategy.position_size == 0
+
+longSignal  = bullTap and biasBull and confLong  >= minConfluences and timeOK and flat and longsToday  < maxLongsDay
+shortSignal = bearTap and biasBear and confShort >= minConfluences and timeOK and flat and shortsToday < maxShortsDay
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  7. POSITION SIZING, ENTRIES & EXITS
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+
+// Contracts from dollar risk: floor(risk$ / (stop distance in points * point value)), min 1.
+// syminfo.pointvalue = $5 for MES, $2 for MNQ, $50 for ES, $20 for NQ.
+calcQty(float stopDistPoints) =>
+    float q = fixedContracts
+    if sizingMode == "Risk % of Equity"
+        riskDollars     = strategy.equity * riskPct / 100.0
+        perContractRisk = stopDistPoints * syminfo.pointvalue
+        q := perContractRisk > 0 ? math.max(1, math.floor(riskDollars / perContractRisk)) : 1
+    q
+
+// Trade-state vars shared by the (single) open position. na when flat.
+var float slAct      = na     // active stop level
+var float tp1Act     = na     // active scale-out target
+var float tp2Act     = na     // active final target
+var float initialQty = na     // contracts at fill (to detect the TP1 partial)
+var bool  beDone     = false  // break-even already applied?
+var int   pendingBar = na     // bar a limit entry order was submitted (for expiry)
+
+// ── 7a. Submit entry orders on a signal ─────────────────────────────────────────────────────────
+if longSignal
+    // Expected entry: next bar ~close for market orders, zone midpoint for limit orders.
+    expEntry = entryMode == "Market" ? close : math.avg(tapTopL, tapBotL)
+    // Structural stop below the zone or swing, plus an ATR buffer.
+    slLvl = switch stopMode
+        "Zone + ATR buffer"  => tapBotL - atr * stopAtrMult
+        "Swing + ATR buffer" => nz(lastPivotLow, tapBotL) - atr * stopAtrMult
+        => expEntry - stopFixedTicks * syminfo.mintick
+    slLvl := math.min(slLvl, expEntry - syminfo.mintick)   // safety: stop must sit below entry
+    risk  = expEntry - slLvl
+    qty   = calcQty(risk)
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    if entryMode == "Market"
+        strategy.entry("Long", strategy.long, qty)
+        pendingBar := na
+    else
+        strategy.entry("Long", strategy.long, qty, limit = expEntry)
+        pendingBar := bar_index
+    // Provisional exit levels (refined with the actual fill price in 7b).
+    slAct  := slLvl
+    tp1Act := expEntry + tp1RR * risk
+    tp2Act := expEntry + rrTarget * risk
+
+if shortSignal
+    expEntry = entryMode == "Market" ? close : math.avg(tapTopS, tapBotS)
+    slLvl = switch stopMode
+        "Zone + ATR buffer"  => tapTopS + atr * stopAtrMult
+        "Swing + ATR buffer" => nz(lastPivotHigh, tapTopS) + atr * stopAtrMult
+        => expEntry + stopFixedTicks * syminfo.mintick
+    slLvl := math.max(slLvl, expEntry + syminfo.mintick)   // safety: stop must sit above entry
+    risk  = slLvl - expEntry
+    qty   = calcQty(risk)
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    if entryMode == "Market"
+        strategy.entry("Short", strategy.short, qty)
+        pendingBar := na
+    else
+        strategy.entry("Short", strategy.short, qty, limit = expEntry)
+        pendingBar := bar_index
+    slAct  := slLvl
+    tp1Act := expEntry - tp1RR * risk
+    tp2Act := expEntry - rrTarget * risk
+
+// Expire unfilled limit entries.
+if flat and not na(pendingBar) and bar_index - pendingBar >= limitExpiryBars
+    strategy.cancel("Long")
+    strategy.cancel("Short")
+    pendingBar := na
+
+// ── 7b. On fill: recompute exact levels from the real average price ─────────────────────────────
+justOpenedLong  = strategy.position_size > 0 and strategy.position_size[1] <= 0
+justOpenedShort = strategy.position_size < 0 and strategy.position_size[1] >= 0
+
+if justOpenedLong
+    avg = strategy.position_avg_price
+    if stopMode == "Fixed Ticks"
+        slAct := avg - stopFixedTicks * syminfo.mintick
+    slAct      := math.min(slAct, avg - syminfo.mintick)
+    riskPts     = avg - slAct
+    tp1Act     := avg + tp1RR * riskPts
+    tp2Act     := avg + rrTarget * riskPts
+    initialQty := math.abs(strategy.position_size)
+    beDone     := false
+    pendingBar := na
+    longsToday += 1
+
+if justOpenedShort
+    avg = strategy.position_avg_price
+    if stopMode == "Fixed Ticks"
+        slAct := avg + stopFixedTicks * syminfo.mintick
+    slAct      := math.max(slAct, avg + syminfo.mintick)
+    riskPts     = slAct - avg
+    tp1Act     := avg - tp1RR * riskPts
+    tp2Act     := avg - rrTarget * riskPts
+    initialQty := math.abs(strategy.position_size)
+    beDone     := false
+    pendingBar := na
+    shortsToday += 1
+
+// ── 7c. Manage exits every bar (orders are modified in place by re-issuing the same IDs) ────────
+trailOffsetTicks = math.max(1, math.round(atr * trailAtrMult / syminfo.mintick))
+
+// Exits are also submitted on the SIGNAL bar (with provisional levels) so the fill bar itself is
+// protected; once the fill is confirmed, the same order IDs are re-issued with exact levels.
+if strategy.position_size > 0 or longSignal
+    // Break-even: once the position size drops below the initial fill (TP1 partial filled).
+    if useBreakeven and useScaleOut and not beDone and not na(initialQty) and strategy.position_size > 0 and math.abs(strategy.position_size) < initialQty
+        slAct  := strategy.position_avg_price + beOffsetTicks * syminfo.mintick
+        beDone := true
+    if useScaleOut
+        strategy.exit("L-TP1", from_entry = "Long", qty_percent = scaleOutPct, stop = slAct, limit = tp1Act, comment_profit = "TP1", comment_loss = "SL")
+        if runnerMode == "Fixed R Target"
+            strategy.exit("L-TP2", from_entry = "Long", stop = slAct, limit = tp2Act, comment_profit = "TP2", comment_loss = "SL")
+        else
+            // Runner trails by ATR once price reaches the TP1 level.
+            strategy.exit("L-TRL", from_entry = "Long", stop = slAct, trail_price = tp1Act, trail_offset = trailOffsetTicks, comment = "Trail")
+    else
+        strategy.exit("L-TP2", from_entry = "Long", stop = slAct, limit = tp2Act, comment_profit = "TP", comment_loss = "SL")
+
+if strategy.position_size < 0 or shortSignal
+    if useBreakeven and useScaleOut and not beDone and not na(initialQty) and strategy.position_size < 0 and math.abs(strategy.position_size) < initialQty
+        slAct  := strategy.position_avg_price - beOffsetTicks * syminfo.mintick
+        beDone := true
+    if useScaleOut
+        strategy.exit("S-TP1", from_entry = "Short", qty_percent = scaleOutPct, stop = slAct, limit = tp1Act, comment_profit = "TP1", comment_loss = "SL")
+        if runnerMode == "Fixed R Target"
+            strategy.exit("S-TP2", from_entry = "Short", stop = slAct, limit = tp2Act, comment_profit = "TP2", comment_loss = "SL")
+        else
+            strategy.exit("S-TRL", from_entry = "Short", stop = slAct, trail_price = tp1Act, trail_offset = trailOffsetTicks, comment = "Trail")
+    else
+        strategy.exit("S-TP2", from_entry = "Short", stop = slAct, limit = tp2Act, comment_profit = "TP", comment_loss = "SL")
+
+// ── 7d. End-of-day flat & state reset ────────────────────────────────────────────────────────────
+if eodNow
+    strategy.cancel_all()
+    if strategy.position_size != 0
+        strategy.close_all(comment = "EOD flat")
+    pendingBar := na
+
+justClosed = flat and strategy.position_size[1] != 0
+if justClosed
+    slAct      := na
+    tp1Act     := na
+    tp2Act     := na
+    initialQty := na
+    beDone     := false
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  8. PLOTTING
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  (FVG/IFVG boxes are drawn in section 5. Everything else lives here.)
+
+// HTF bias: EMA line + background tint.
+plot(showHtfEma ? htfEma : na, "HTF EMA", color = biasBull ? color.new(#26a69a, 20) : color.new(#ef5350, 20), linewidth = 2)
+bgcolor(showBiasBg ? (biasBull ? color.new(#26a69a, 94) : biasBear ? color.new(#ef5350, 94) : na) : na, title = "HTF bias tint")
+
+// Entry signal markers. NOTE: the marker shows the SIGNAL bar — the fill happens on the next bar
+// open (market) or when the limit is touched.
+plotshape(longSignal,  "Long signal",  shape.triangleup,   location.belowbar, color.new(#26a69a, 0), size = size.small, text = "L")
+plotshape(shortSignal, "Short signal", shape.triangledown, location.abovebar, color.new(#ef5350, 0), size = size.small, text = "S")
+
+// Active stop / targets while a position is open.
+inLong  = strategy.position_size > 0
+inShort = strategy.position_size < 0
+plot(inLong or inShort ? slAct : na,                 "Stop loss",  color.new(#ef5350, 0),  2, plot.style_linebr)
+plot((inLong or inShort) and useScaleOut ? tp1Act : na, "TP1",     color.new(#26a69a, 30), 1, plot.style_linebr)
+plot(inLong or inShort ? tp2Act : na,                "Final TP",   color.new(#26a69a, 0),  2, plot.style_linebr)
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  9. ALERTS
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//  Create an alert on this strategy → condition "FVG/IFVG Long Entry" (or Short) to drive
+//  webhooks for automation. Placeholders resolve at alert time.
+
+alertcondition(longSignal,  title = "FVG/IFVG Long Entry",  message = "FVG/IFVG LONG {{ticker}} {{interval}} @ {{close}}")
+alertcondition(shortSignal, title = "FVG/IFVG Short Entry", message = "FVG/IFVG SHORT {{ticker}} {{interval}} @ {{close}}")
