@@ -1,0 +1,243 @@
+//@version=6
+//
+// ============================================================================
+//  Opening-Range Breakout + VWAP / Volatility Filters — /MES (or /ES) Day Trade
+// ============================================================================
+//
+//  EDUCATIONAL USE ONLY. NOT FINANCIAL ADVICE. Hypothetical or backtested
+//  performance is not indicative of future results. Trading futures involves
+//  substantial risk of loss and is not suitable for all investors.
+//
+//  Designed for: CME Micro E-mini S&P 500 (/MES) on a 5-minute chart.
+//  Also works on /ES — adjust commission and max contracts accordingly.
+//
+//  Logic summary
+//  -------------
+//  1. Build the opening range (OR) from 9:30–10:00 ET.
+//  2. Only trade if OR width is between orMinFrac and orMaxFrac of the
+//     14-day daily ATR (skips dead days and blown-out days).
+//  3. Long:  first 5-min CLOSE above OR high, with close > RTH-anchored VWAP.
+//     Short: first 5-min CLOSE below OR low,  with close < RTH-anchored VWAP.
+//     One attempt per direction per day; entries only 10:00–13:30 ET.
+//  4. Initial stop = 1.5 x ATR(14, 5m). Target = 2R. Stop moves to breakeven
+//     after price closes +1R in favor. Everything flattens by 15:55 ET.
+//  5. Position size = floor(risk% of equity / $risk per contract), capped.
+//  6. Circuit breaker: no new trades and flatten if daily loss >= limit.
+//     Blackout dates input skips FOMC/CPI/NFP days (maintain manually).
+//
+//  Fills are modeled on the NEXT bar open after a signal bar close, with
+//  commission and 1 tick slippage per side set in the declaration below —
+//  adjust both to your broker and re-test with 2 ticks slippage before
+//  believing any backtest.
+//
+strategy("ORB + VWAP Day Trade [MES] (Educational)",
+     shorttitle              = "ORB-VWAP MES",
+     overlay                 = true,
+     initial_capital         = 25000,
+     currency                = currency.USD,
+     commission_type         = strategy.commission.cash_per_contract,
+     commission_value        = 1.25,     // $/contract per SIDE — set to your broker's all-in rate
+     slippage                = 1,        // ticks per fill; re-test with 2
+     pyramiding              = 0,
+     calc_on_every_tick      = false,
+     default_qty_type        = strategy.fixed,
+     default_qty_value       = 1)
+
+// ---------------------------------------------------------------------------
+// Inputs
+// ---------------------------------------------------------------------------
+string tzNY = "America/New_York"
+
+string grpTime = "Session timing (ET)"
+orSess    = input.session("0930-1000", "Opening-range window",  group = grpTime)
+entrySess = input.session("1000-1330", "New-entry window",      group = grpTime)
+flatSess  = input.session("1555-1600", "Forced-flat window",    group = grpTime)
+
+string grpFilt = "Filters"
+atrLen        = input.int(14,     "Intraday ATR length (chart TF)",                    minval = 2,    group = grpFilt)
+orMinFrac     = input.float(0.15, "Min OR width, fraction of daily ATR(14)",           step = 0.05,   group = grpFilt)
+orMaxFrac     = input.float(0.70, "Max OR width, fraction of daily ATR(14)",           step = 0.05,   group = grpFilt)
+useVwapFilter = input.bool(true,  "Require close on VWAP side of trade",                              group = grpFilt)
+blackoutTxt   = input.text_area("2026-07-28,2026-07-29,2026-08-07,2026-09-15,2026-09-16",
+     "Blackout dates (YYYY-MM-DD, comma or newline separated). Keep FOMC / CPI / NFP days here — Pine cannot read a news calendar.",
+     group = grpFilt)
+
+string grpRisk = "Risk & sizing"
+riskPct       = input.float(0.5,  "Risk per trade, % of equity",                       step = 0.1, minval = 0.05, group = grpRisk)
+stopAtrMult   = input.float(1.5,  "Initial stop, ATR multiple",                        step = 0.25,   group = grpRisk)
+targetR       = input.float(2.0,  "Profit target, R multiple",                         step = 0.25,   group = grpRisk)
+beTriggerR    = input.float(1.0,  "Move stop to breakeven after +R",                   step = 0.25,   group = grpRisk)
+maxContracts  = input.int(10,     "Max contracts",                                     minval = 1,    group = grpRisk)
+maxTradesDay  = input.int(2,      "Max trades per day",                                minval = 1,    group = grpRisk)
+maxDayLossPct = input.float(1.5,  "Daily-loss circuit breaker, % of day-start equity", step = 0.25,   group = grpRisk)
+strictTf      = input.bool(true,  "Error if chart is not 5-minute",                                   group = grpRisk)
+
+if strictTf and timeframe.in_seconds() != 300
+    runtime.error("This strategy is specified for a 5-minute chart. Switch the chart to 5m or disable 'strict timeframe'.")
+
+// ---------------------------------------------------------------------------
+// Session state
+// ---------------------------------------------------------------------------
+bool inOR    = not na(time(timeframe.period, orSess,      tzNY))
+bool inEntry = not na(time(timeframe.period, entrySess,   tzNY))
+bool inFlat  = not na(time(timeframe.period, flatSess,    tzNY))
+bool inRTH   = not na(time(timeframe.period, "0930-1600", tzNY))
+bool rthStart = inRTH and not inRTH[1]
+
+// ---------------------------------------------------------------------------
+// RTH-anchored VWAP (manual, so it behaves the same on ETH and RTH charts)
+// ---------------------------------------------------------------------------
+var float cumPV = na
+var float cumV  = na
+if rthStart
+    cumPV := 0.0
+    cumV  := 0.0
+if inRTH
+    cumPV += hlc3 * volume
+    cumV  += volume
+float rthVwap = inRTH and not na(cumV) and cumV > 0 ? cumPV / cumV : na
+
+// ---------------------------------------------------------------------------
+// Daily ATR — previous completed day, non-repainting ([1] + lookahead_on)
+// ---------------------------------------------------------------------------
+float dailyAtr = request.security(syminfo.tickerid, "1D", ta.atr(14)[1], lookahead = barmerge.lookahead_on)
+
+// ---------------------------------------------------------------------------
+// Opening range
+// ---------------------------------------------------------------------------
+var float orHigh = na
+var float orLow  = na
+var bool  orDone = false
+if rthStart
+    orHigh := na
+    orLow  := na
+    orDone := false
+if inOR
+    orHigh := na(orHigh) ? high : math.max(orHigh, high)
+    orLow  := na(orLow)  ? low  : math.min(orLow,  low)
+if not inOR and inOR[1] and not na(orHigh)
+    orDone := true
+
+float orWidth  = orDone ? orHigh - orLow : na
+bool  orWidthOk = orDone and not na(dailyAtr) and dailyAtr > 0 and
+     orWidth >= orMinFrac * dailyAtr and orWidth <= orMaxFrac * dailyAtr
+
+// ---------------------------------------------------------------------------
+// Blackout dates (manually maintained macro-event calendar)
+// ---------------------------------------------------------------------------
+var array<string> blackoutArr = str.split(str.replace_all(str.replace_all(blackoutTxt, "\n", ","), " ", ""), ",")
+string todayStr  = str.format_time(time, "yyyy-MM-dd", tzNY)
+bool   isBlackout = array.includes(blackoutArr, todayStr)
+
+// ---------------------------------------------------------------------------
+// Daily counters and circuit breaker
+// ---------------------------------------------------------------------------
+var float dayStartEquity = na
+var int   tradesToday    = 0
+var bool  longTaken      = false
+var bool  shortTaken     = false
+if rthStart
+    dayStartEquity := strategy.equity
+    tradesToday    := 0
+    longTaken      := false
+    shortTaken     := false
+
+bool posJustOpened = strategy.position_size != 0 and strategy.position_size[1] == 0
+if posJustOpened
+    tradesToday += 1
+
+float dayPnl = strategy.equity - dayStartEquity
+bool  halted = not na(dayStartEquity) and dayPnl <= -(maxDayLossPct / 100.0) * dayStartEquity
+
+// ---------------------------------------------------------------------------
+// Position sizing — risk a fixed % of current equity against the initial stop
+// ---------------------------------------------------------------------------
+float atrNow          = ta.atr(atrLen)
+float stopPts         = stopAtrMult * atrNow                 // stop distance in points
+float perContractRisk = stopPts * syminfo.pointvalue         // $ risk per contract
+float riskDollars     = strategy.equity * riskPct / 100.0
+int   qty             = perContractRisk > 0 ? math.min(maxContracts, int(math.floor(riskDollars / perContractRisk))) : 0
+// If qty is 0 the stop is too wide for the account at this risk % — no trade.
+
+// ---------------------------------------------------------------------------
+// Entries — first 5-min close through the OR extreme, on the VWAP side
+// ---------------------------------------------------------------------------
+bool baseOk = orDone and orWidthOk and inEntry and not isBlackout and not halted and
+     strategy.position_size == 0 and tradesToday < maxTradesDay and qty >= 1 and not na(rthVwap)
+
+bool longSig  = baseOk and not longTaken  and close > orHigh and (not useVwapFilter or close > rthVwap)
+bool shortSig = baseOk and not shortTaken and close < orLow  and (not useVwapFilter or close < rthVwap)
+
+var float pendRiskPts = na    // stop distance captured on the signal bar
+
+if longSig
+    pendRiskPts := stopPts
+    longTaken   := true
+    strategy.entry("L", strategy.long, qty = qty,
+         alert_message = '{"symbol":"' + syminfo.ticker + '","action":"buy","qty":' + str.tostring(qty) + ',"reason":"ORB long"}')
+if shortSig
+    pendRiskPts := stopPts
+    shortTaken  := true
+    strategy.entry("S", strategy.short, qty = qty,
+         alert_message = '{"symbol":"' + syminfo.ticker + '","action":"sell","qty":' + str.tostring(qty) + ',"reason":"ORB short"}')
+
+// ---------------------------------------------------------------------------
+// Stops, targets, breakeven — anchored to the actual average fill price
+// ---------------------------------------------------------------------------
+var float stopPrice   = na
+var float targetPrice = na
+
+if strategy.position_size == 0
+    stopPrice   := na
+    targetPrice := na
+
+if posJustOpened and not na(pendRiskPts)
+    float avg = strategy.position_avg_price
+    if strategy.position_size > 0
+        stopPrice   := avg - pendRiskPts
+        targetPrice := avg + targetR * pendRiskPts
+    else
+        stopPrice   := avg + pendRiskPts
+        targetPrice := avg - targetR * pendRiskPts
+
+// Breakeven: only after a full bar CLOSE beyond +beTriggerR (conservative)
+if strategy.position_size > 0 and close >= strategy.position_avg_price + beTriggerR * pendRiskPts
+    stopPrice := math.max(stopPrice, strategy.position_avg_price)
+if strategy.position_size < 0 and close <= strategy.position_avg_price - beTriggerR * pendRiskPts
+    stopPrice := math.min(stopPrice, strategy.position_avg_price)
+
+if strategy.position_size > 0
+    strategy.exit("Lx", "L", stop = stopPrice, limit = targetPrice,
+         alert_message = '{"symbol":"' + syminfo.ticker + '","action":"sell","qty":"all","reason":"long exit"}')
+if strategy.position_size < 0
+    strategy.exit("Sx", "S", stop = stopPrice, limit = targetPrice,
+         alert_message = '{"symbol":"' + syminfo.ticker + '","action":"buy","qty":"all","reason":"short exit"}')
+
+// ---------------------------------------------------------------------------
+// Forced flat: end of session or circuit breaker
+// ---------------------------------------------------------------------------
+if (inFlat or halted) and strategy.position_size != 0
+    strategy.cancel_all()
+    strategy.close_all(comment = halted ? "circuit breaker" : "EOD flat",
+         alert_message = '{"symbol":"' + syminfo.ticker + '","action":"flat","qty":"all","reason":"' + (halted ? "circuit breaker" : "EOD flat") + '"}')
+
+// ---------------------------------------------------------------------------
+// Plots and visual aids
+// ---------------------------------------------------------------------------
+plot(orDone and inRTH ? orHigh : na, "OR high",  color.new(color.teal,   0), 2, plot.style_linebr)
+plot(orDone and inRTH ? orLow  : na, "OR low",   color.new(color.maroon, 0), 2, plot.style_linebr)
+plot(rthVwap,                        "RTH VWAP", color.new(color.orange, 0), 1, plot.style_linebr)
+plot(strategy.position_size != 0 ? stopPrice   : na, "Stop",   color.new(color.red,   30), 1, plot.style_linebr)
+plot(strategy.position_size != 0 ? targetPrice : na, "Target", color.new(color.green, 30), 1, plot.style_linebr)
+bgcolor(halted ? color.new(color.red, 85) : isBlackout and inRTH ? color.new(color.gray, 85) : orDone and not orWidthOk and inRTH ? color.new(color.yellow, 92) : na,
+     title = "Red = circuit breaker, gray = blackout day, yellow = OR width filter failed")
+
+// ---------------------------------------------------------------------------
+// Alerts
+// ---------------------------------------------------------------------------
+// For full automation: create ONE alert on this strategy with trigger
+// "Order fills and alert() function calls" and message {{strategy.order.alert_message}}.
+// The JSON payloads above are then forwarded to your webhook.
+// The alertconditions below are for semi-automated (signal-only) alerting.
+alertcondition(longSig,  "ORB long signal",  "ORB long breakout on {{ticker}} at {{close}}")
+alertcondition(shortSig, "ORB short signal", "ORB short breakout on {{ticker}} at {{close}}")

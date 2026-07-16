@@ -5,8 +5,18 @@ A Python 3.11 futures trading bot scaffold that uses
 [`ib_insync`](https://github.com/erdewit/ib_insync) for live integration with
 Interactive Brokers (IBKR).
 
-This repository currently contains only the project layout — no strategy logic
-has been implemented yet.
+The first strategy — an Opening-Range Breakout with VWAP and volatility
+filters for /MES — is fully specified in [`docs/STRATEGY.md`](docs/STRATEGY.md),
+with a ready-to-use TradingView implementation in
+[`pinescript/orb_vwap_mes.pine`](pinescript/orb_vwap_mes.pine) and a
+standalone pandas/numpy research backtester in
+[`research/backtest_skeleton.py`](research/backtest_skeleton.py). The
+`src/` backtrader/IBKR scaffold is the eventual home for live wiring once the
+strategy survives validation.
+
+> **Educational use only — not financial advice.** Hypothetical or past
+> performance is not indicative of future results. Futures trading involves
+> substantial risk of loss.
 
 ## Requirements
 
